@@ -7,6 +7,7 @@ const stealthPlugin = StealthPlugin();
 puppeteer.use(stealthPlugin);
 
 import { getTargetUrl, getTargetHost } from "./target-config";
+import { solveTurnstile } from "./captcha-solver";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36";
 
 const PROXY_HOST = process.env.PROXY_HOST || "gw.dataimpulse.com";
@@ -167,13 +168,31 @@ async function extractSiteKey(page: Page): Promise<string> {
   if (networkKey) return networkKey;
 
   return await page.evaluate(() => {
+    // Turnstile check first
+    const turnstileEl = document.querySelector(".cf-turnstile");
+    if (turnstileEl) {
+      const key = turnstileEl.getAttribute("data-sitekey");
+      if (key) return key.trim();
+    }
+    
+    // Check for turnstile script src containing sitekey
+    const scripts = Array.from(document.querySelectorAll('script'));
+    for (const s of scripts) {
+      if (s.src && s.src.includes('challenges.cloudflare.com')) {
+        // Sometimes key is in URL params? Usually not, but worth checking if needed
+      }
+    }
+
+    // reCAPTCHA check
     const el = document.querySelector("[data-sitekey]");
     if (el) return (el.getAttribute("data-sitekey") || "").trim();
     for (const s of Array.from(document.querySelectorAll('script[src*="recaptcha"]'))) {
       const m = s.getAttribute("src")?.match(/render=([A-Za-z0-9_-]{30,})/);
       if (m) return m[1].trim();
     }
-    return "6LdHNV8rAAAAADFdYiPXfZd9LGmYRv0L6JkXp3gg"; // Fallback
+    
+    // Default fallback (reCAPTCHA)
+    return "6LdHNV8rAAAAADFdYiPXfZd9LGmYRv0L6JkXp3gg"; 
   });
 }
 
@@ -226,7 +245,7 @@ export async function directBrowserLogin(email: string, password: string, captch
 
     log("BROWSER-LOGIN", "Submitting login via AJAX POST to /tr/Login/Login...");
     const currentTargetHost = getTargetHost();
-    const ajaxResult = await page.evaluate(async (emailVal: string, passVal: string, tokenVal: string, csrf: string, tHost: string) => {
+    const performAjaxLogin = async (emailVal: string, passVal: string, tokenVal: string, csrf: string, tHost: string) => {
       const params = new URLSearchParams();
       if (csrf) params.append('__RequestVerificationToken', csrf);
       params.append('FormToken', document.location.host || tHost);
@@ -251,17 +270,141 @@ export async function directBrowserLogin(email: string, password: string, captch
       } catch (e: any) {
         return { status: 0, body: 'FETCH_ERROR: ' + (e.message || ''), headers: {} };
       }
-    }, email, password, token, csrfToken, currentTargetHost);
+    };
+
+    const ajaxResult = await page.evaluate(performAjaxLogin, email, password, token, csrfToken, currentTargetHost);
 
     log("BROWSER-LOGIN", `AJAX result: status=${ajaxResult.status}, body=${ajaxResult.body.substring(0, 200)}`);
 
     if (ajaxResult.body.includes('moment') || ajaxResult.body.includes('challenge') || ajaxResult.status === 403) {
-      log("BROWSER-LOGIN", "CF challenge blocked AJAX POST. cf_clearance needed.");
-      const cookies2 = await page.cookies();
-      const cookieMap2: Record<string, string> = {};
-      for (const c of cookies2) cookieMap2[c.name] = c.value;
-      await page.close();
-      return { success: false, cookies: cookieMap2, error: "Cloudflare koruma aktif. cf_clearance cookie gerekli." };
+      log("BROWSER-LOGIN", "CF challenge blocked AJAX POST. Trying Turnstile interaction on login page...");
+
+      try {
+        const challengeInfo = await page.evaluate(() => {
+          const iframes = Array.from(document.querySelectorAll('iframe'));
+          const turnstileIframes = iframes.filter(f => (f as HTMLIFrameElement).src && (f as HTMLIFrameElement).src.includes('challenges.cloudflare.com'));
+          const checkboxes = document.querySelectorAll('input[type=\"checkbox\"]');
+          const buttons = document.querySelectorAll('button, [role=\"button\"]');
+          return {
+            iframeCount: iframes.length,
+            turnstileCount: turnstileIframes.length,
+            checkboxCount: checkboxes.length,
+            buttonCount: buttons.length,
+          };
+        });
+        log("BROWSER-LOGIN", `Login challenge info: ${JSON.stringify(challengeInfo)}`);
+
+        if (challengeInfo.turnstileCount > 0) {
+          log("BROWSER-LOGIN", "Turnstile detected during login! Attempting to solve with 2Captcha...");
+          
+          try {
+            // 1. Sitekey'i bul
+            const siteKey = await page.evaluate(() => {
+              const el = document.querySelector('.cf-turnstile') || document.querySelector('[data-sitekey]');
+              if (el) return el.getAttribute('data-sitekey');
+              
+              // Scriptlerden ara
+              const scripts = document.querySelectorAll('script');
+              for (const s of Array.from(scripts)) {
+                if (s.textContent && s.textContent.includes('turnstile.render')) {
+                  const match = s.textContent.match(/sitekey:\s*['"]([^'"]+)['"]/);
+                  if (match) return match[1];
+                }
+              }
+              return null;
+            });
+
+            let solved = false;
+            if (siteKey) {
+              log("BROWSER-LOGIN", `Found Turnstile sitekey: ${siteKey}`);
+              const solveResult = await solveTurnstile(getTargetUrl() + "/tr/Login/Login", siteKey, "login");
+              
+              if (solveResult.success && solveResult.token) {
+                log("BROWSER-LOGIN", `Turnstile solved! Token: ${solveResult.token.substring(0, 20)}...`);
+                
+                await page.evaluate((token) => {
+                  // Token'ı inputlara bas
+                  const inputs = document.querySelectorAll('[name="cf-turnstile-response"], [name="g-recaptcha-response"]');
+                  inputs.forEach(inp => { (inp as HTMLInputElement).value = token; });
+                  
+                  // Global değişkene ata
+                  (window as any).cf_turnstile_token = token;
+                  
+                  // Varsa callback'i tetikle (Cloudflare genellikle otomatik algılar ama biz yine de deneyelim)
+                  try {
+                    if ((window as any).turnstile && (window as any).turnstile.getResponse) {
+                      // Turnstile API varsa resetleyip manuel değer atanamaz ama callback çağrılabilir
+                    }
+                  } catch(e) {}
+                }, solveResult.token);
+                
+                solved = true;
+                await sleep(2000);
+              } else {
+                log("BROWSER-LOGIN", `2Captcha failed: ${solveResult.error}`);
+              }
+            }
+
+            if (!solved) {
+              log("BROWSER-LOGIN", "2Captcha failed or sitekey not found. Falling back to click interaction...");
+              const turnstileFrame = page.frames().find(f => f.url().includes('challenges.cloudflare.com'));
+              if (turnstileFrame) {
+                const checkbox = await turnstileFrame.$('input[type=\"checkbox\"]') ||
+                                 await turnstileFrame.$('.cb-i') ||
+                                 await turnstileFrame.$('[role=\"checkbox\"]');
+                if (checkbox) {
+                  log("BROWSER-LOGIN", "Found Turnstile checkbox, clicking...");
+                  await checkbox.click();
+                } else {
+                  log("BROWSER-LOGIN", "Clicking center of Turnstile iframe...");
+                  const frameElement = await page.$('iframe[src*=\"challenges.cloudflare.com\"]');
+                  if (frameElement) {
+                    const box = await frameElement.boundingBox();
+                    if (box) await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+                  }
+                }
+                await sleep(5000);
+              }
+            }
+          } catch (e: any) {
+            log("BROWSER-LOGIN", `Turnstile interaction error: ${e.message}`);
+          }
+        }
+
+        try {
+          log("BROWSER-LOGIN", "Waiting up to 20s for login challenge resolution...");
+          await page.waitForFunction(() => {
+            return !document.title.includes("moment") && !document.title.includes("Checking") && !document.title.includes("Cloudflare");
+          }, { timeout: 20000 });
+          await sleep(3000);
+        } catch {
+          log("BROWSER-LOGIN", "Login challenge did not resolve after interaction.");
+        }
+
+        log("BROWSER-LOGIN", "Retrying AJAX login once after Turnstile interaction...");
+        const ajaxResult2 = await page.evaluate(performAjaxLogin, email, password, token, csrfToken, currentTargetHost);
+        log("BROWSER-LOGIN", `AJAX retry result: status=${ajaxResult2.status}, body=${ajaxResult2.body.substring(0, 200)}`);
+
+        if (!(ajaxResult2.body.includes('moment') || ajaxResult2.body.includes('challenge') || ajaxResult2.status === 403)) {
+          // Treat retry as main result
+          (ajaxResult as any).status = ajaxResult2.status;
+          (ajaxResult as any).body = ajaxResult2.body;
+        } else {
+          log("BROWSER-LOGIN", "Login challenge still blocking after retry. cf_clearance/cookies needed.");
+          const cookies2 = await page.cookies();
+          const cookieMap2: Record<string, string> = {};
+          for (const c of cookies2) cookieMap2[c.name] = c.value;
+          await page.close();
+          return { success: false, cookies: cookieMap2, error: "Cloudflare koruma aktif. cf_clearance cookie gerekli." };
+        }
+      } catch (e: any) {
+        log("BROWSER-LOGIN", `Error while trying to solve Turnstile on login: ${e.message}`);
+        const cookies2 = await page.cookies();
+        const cookieMap2: Record<string, string> = {};
+        for (const c of cookies2) cookieMap2[c.name] = c.value;
+        await page.close();
+        return { success: false, cookies: cookieMap2, error: "Cloudflare koruma aktif. cf_clearance cookie gerekli." };
+      }
     }
 
     if (ajaxResult.status === 200 || (ajaxResult.status >= 200 && ajaxResult.status < 400)) {
@@ -430,30 +573,101 @@ async function _doBypass(): Promise<CloudflareCookies | null> {
         log("CF", `Challenge HTML: ${challengeInfo.htmlSnippet.substring(0, 500)}`);
 
         if (challengeInfo.turnstileIframes.length > 0) {
-          log("CF", "Turnstile iframe detected! Attempting to interact...");
+          log("CF", "Turnstile iframe detected! Attempting to solve with 2Captcha...");
+          
           try {
-            const turnstileFrame = page.frames().find(f => f.url().includes('challenges.cloudflare.com'));
-            if (turnstileFrame) {
-              log("CF", `Found Turnstile frame: ${turnstileFrame.url().substring(0, 100)}`);
-              const checkbox = await turnstileFrame.$('input[type="checkbox"]') || await turnstileFrame.$('.cb-i') || await turnstileFrame.$('[role="checkbox"]');
-              if (checkbox) {
-                log("CF", "Found checkbox in Turnstile, clicking...");
-                await checkbox.click();
-                await sleep(5000);
+            // 1. Sitekey'i bul
+            const siteKey = await page.evaluate(() => {
+              // Turnstile genellikle .cf-turnstile içinde data-sitekey attribute'unda bulunur
+              const el = document.querySelector('.cf-turnstile');
+              if (el) return el.getAttribute('data-sitekey');
+              
+              // Veya iframe src'sinde olabilir (nadiren)
+              const iframes = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]');
+              for (const f of Array.from(iframes)) {
+                // Iframe src'sinden sitekey çıkarmak zor olabilir, genellikle parent elementte bulunur
+              }
+              
+              // Script taglerinde arayalım
+              const scripts = document.querySelectorAll('script');
+              for (const s of Array.from(scripts)) {
+                if (s.src && s.src.includes('challenges.cloudflare.com')) {
+                  // Script src'sinde sitekey olabilir mi? Genellikle hayır.
+                }
+                // Inline scriptlerde turnstile.render çağrısı aranabilir
+                if (s.textContent && s.textContent.includes('turnstile.render')) {
+                  const match = s.textContent.match(/sitekey:\s*['"]([^'"]+)['"]/);
+                  if (match) return match[1];
+                }
+              }
+              
+              return null;
+            });
+
+            if (siteKey) {
+              log("CF", `Found Turnstile sitekey: ${siteKey}`);
+              
+              // 2. 2Captcha ile çöz
+              const solveResult = await solveTurnstile(url, siteKey);
+              
+              if (solveResult.success && solveResult.token) {
+                log("CF", `Turnstile solved via 2Captcha! Token: ${solveResult.token.substring(0, 20)}...`);
+                
+                // 3. Token'ı sayfaya inject et
+                await page.evaluate((token) => {
+                  // cf-turnstile-response input'unu bul ve doldur
+                  const input = document.querySelector('[name="cf-turnstile-response"]');
+                  if (input) {
+                    (input as HTMLInputElement).value = token;
+                    // Form submit tetikle (varsa)
+                    // Genellikle Cloudflare otomatik algılar veya callback çalıştırır
+                  }
+                  
+                  // Turnstile callback'ini tetikle (eğer biliniyorsa)
+                  // window.turnstile.render callback'i... bu zor olabilir.
+                  
+                  // Alternatif: Token'ı global bir değişkene ata, belki site kullanır
+                  (window as any).cf_turnstile_token = token;
+                }, solveResult.token);
+                
+                // 4. Bekle ve kontrol et
+                await sleep(3000);
               } else {
-                log("CF", "No checkbox found in Turnstile frame, clicking center of frame...");
-                const frameElement = await page.$('iframe[src*="challenges.cloudflare.com"]');
-                if (frameElement) {
-                  const box = await frameElement.boundingBox();
-                  if (box) {
-                    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-                    await sleep(5000);
+                log("CF", `2Captcha failed: ${solveResult.error}`);
+                // Fallback: Tıklama yöntemini dene
+                throw new Error("2Captcha failed, falling back to click");
+              }
+            } else {
+              log("CF", "Could not find Turnstile sitekey, falling back to click method...");
+              throw new Error("Sitekey not found");
+            }
+          } catch (e: any) {
+            log("CF", `2Captcha/Sitekey error: ${e.message}. Trying click method...`);
+            
+            try {
+              const turnstileFrame = page.frames().find(f => f.url().includes('challenges.cloudflare.com'));
+              if (turnstileFrame) {
+                log("CF", `Found Turnstile frame: ${turnstileFrame.url().substring(0, 100)}`);
+                const checkbox = await turnstileFrame.$('input[type="checkbox"]') || await turnstileFrame.$('.cb-i') || await turnstileFrame.$('[role="checkbox"]');
+                if (checkbox) {
+                  log("CF", "Found checkbox in Turnstile, clicking...");
+                  await checkbox.click();
+                  await sleep(5000);
+                } else {
+                  log("CF", "No checkbox found in Turnstile frame, clicking center of frame...");
+                  const frameElement = await page.$('iframe[src*="challenges.cloudflare.com"]');
+                  if (frameElement) {
+                    const box = await frameElement.boundingBox();
+                    if (box) {
+                      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+                      await sleep(5000);
+                    }
                   }
                 }
               }
+            } catch (clickErr: any) {
+              log("CF", `Turnstile click interaction error: ${clickErr.message}`);
             }
-          } catch (e: any) {
-            log("CF", `Turnstile interaction error: ${e.message}`);
           }
         }
 

@@ -15,7 +15,8 @@
     "deploy:prepare": "npm install && npm run build:prod && npm prune --omit=dev",
     "setup:plesk": "bash setup-plesk.sh",
     "clean:local": "node script/clean-local.mjs",
-    "smoke": "node script/smoke-test.mjs"
+    "smoke": "node script/smoke-test.mjs",
+    "test:login": "tsx server/test-login.ts"
   },
   "dependencies": {
     "resend": "^4.0.0",

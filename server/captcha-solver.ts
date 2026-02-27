@@ -62,6 +62,37 @@ export async function solveRecaptchaV2(
   }
 }
 
+export async function solveTurnstile(
+  pageUrl: string,
+  siteKey: string,
+  action?: string
+): Promise<CaptchaSolveResult> {
+  if (!CAPTCHA_API_KEY) {
+    return { success: false, error: "CAPTCHA_API_KEY not configured" };
+  }
+
+  console.log(`[2CAPTCHA] Solving Turnstile for: ${pageUrl}`);
+  console.log(`[2CAPTCHA] Site key: ${siteKey}`);
+
+  try {
+    // 2captcha-ts veya benzeri kütüphanelerde turnstile metodu olmayabilir,
+    // bu yüzden genel solve metodu veya varsa turnstile metodunu kullanıyoruz.
+    // Kütüphane tipine göre uyarlama yapıyoruz.
+    const result = await (solver as any).turnstile({
+      sitekey: siteKey,
+      pageurl: pageUrl,
+      action: action
+    });
+
+    console.log(`[2CAPTCHA] Solved! Token: ${result.data.substring(0, 50)}...`);
+    return { success: true, token: result.data };
+  } catch (error: any) {
+    console.error(`[2CAPTCHA] Turnstile Error: ${error.message}`);
+    // Fallback: Eğer kütüphane metodu yoksa hata dönebilir
+    return { success: false, error: error.message };
+  }
+}
+
 export function isCaptchaConfigured(): boolean {
   return !!CAPTCHA_API_KEY;
 }
