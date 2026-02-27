@@ -1,0 +1,11 @@
+Headful Chrome + gercek sistem TLS ile Cloudflare bypass yeniden yazildi
+
+- cloudflare-bypass.ts: headless=false, Xvfb sanal ekran, gercek Chrome TLS fingerprint
+- Gelismis stealth: navigator.plugins, window.chrome, WebGL spoof, screen dims
+- Akilli challenge detection: js_challenge, turnstile, managed ayri ayri handle
+- Challenge poll mekanizmasi: 2sn aralikla durum kontrolu
+- Turnstile: 2Captcha + mouse click fallback
+- Browser lifecycle: 30dk restart, disconnect recovery, session rotation
+- routes.ts: cf_clearance expiry tracking, daha iyi 403 retry, admin panel bilgileri
+- setup-plesk.sh: Chrome + Xvfb otomatik kurulum
+- .env.example: CF_HEADLESS modu dokumantasyonu

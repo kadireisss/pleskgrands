@@ -406,7 +406,7 @@ async function postViaProxy(path: string, body: string): Promise<{ statusCode: n
 }
 
 // ═══════════════════════════════════════════════════
-// ─── CF-Ready Gate ───
+// ─── CF-Ready Gate (Headful Chrome + Real TLS) ───
 // ═══════════════════════════════════════════════════
 let cfBypassInProgress = false;
 let cfBypassPromise: Promise<void> | null = null;
@@ -414,14 +414,23 @@ let cfBypassResolve: (() => void) | null = null;
 let lastBypassAttempt = 0;
 let bypassFailCount = 0;
 let proxyVerified = false;
-const BYPASS_COOLDOWN_MS = 120000; // 2 dakika - her 403'te bypass tetiklenmesin
+let cfClearanceExpiry = 0;
+const BYPASS_COOLDOWN_MS = 60000;
 const MAX_AUTO_RETRIES = 5;
+const CF_CLEARANCE_LIFETIME = 8 * 60 * 1000;
 
 function isCfReady(): boolean {
-  return storedCookies.has("cf_clearance") || proxyVerified || storedCookies.size >= 3;
+  if (storedCookies.has("cf_clearance")) {
+    if (cfClearanceExpiry > 0 && Date.now() > cfClearanceExpiry) {
+      log("CF", "cf_clearance expired, needs refresh");
+      return false;
+    }
+    return true;
+  }
+  return proxyVerified || storedCookies.size >= 3;
 }
 
-async function waitForCfReady(timeoutMs = 60000): Promise<boolean> {
+async function waitForCfReady(timeoutMs = 90000): Promise<boolean> {
   if (isCfReady() && !cfBypassInProgress) return true;
   if (cfBypassPromise) {
     await Promise.race([cfBypassPromise, new Promise((r) => setTimeout(r, timeoutMs))]);
@@ -435,35 +444,44 @@ async function waitForCfReady(timeoutMs = 60000): Promise<boolean> {
 }
 
 async function startCfBypass(): Promise<void> {
-  lastBypassAttempt = Date.now();
+  const now = Date.now();
   if (cfBypassInProgress) {
     if (cfBypassPromise) await cfBypassPromise;
     return;
   }
+  if (now - lastBypassAttempt < BYPASS_COOLDOWN_MS && bypassFailCount > 0) {
+    log("CF", `Cooldown active (${Math.ceil((BYPASS_COOLDOWN_MS - (now - lastBypassAttempt)) / 1000)}s remaining)`);
+    return;
+  }
+  lastBypassAttempt = now;
   cfBypassInProgress = true;
   cfBypassPromise = new Promise<void>((resolve) => {
     cfBypassResolve = resolve;
   });
   try {
-    // Sync session BEFORE bypass so Puppeteer uses same IP
     setPuppeteerSessionId(currentSessionId);
-    log("CF", "Starting bypass...");
+    log("CF", "Starting headful Chrome bypass...");
     const cfCookies = await getCloudflareBypassCookies();
     if (cfCookies) {
-      // Sync session AFTER bypass in case Puppeteer changed it during retries
       const newSid = getPuppeteerSessionId();
       if (newSid !== currentSessionId) {
         currentSessionId = newSid;
         proxyAgent = createProxyAgent();
-        log("CF", `Session updated to match Puppeteer: ${currentSessionId}`);
+        log("CF", `Session synced to Puppeteer: ${currentSessionId}`);
       }
       for (const [k, v] of Object.entries(cfCookies.allCookies)) storedCookies.set(k, v);
-      log("CF", `Bypass done, ${storedCookies.size} cookies`);
+      if (cfCookies.cfClearance) {
+        cfClearanceExpiry = Date.now() + CF_CLEARANCE_LIFETIME;
+      }
+      bypassFailCount = 0;
+      log("CF", `Bypass SUCCESS - ${storedCookies.size} cookies, cf_clearance=${!!cfCookies.cfClearance}`);
     } else {
-      log("CF", "Bypass failed");
+      bypassFailCount++;
+      log("CF", `Bypass failed (attempt #${bypassFailCount})`);
     }
   } catch (e: any) {
-    log("CF", `Error: ${e.message}`);
+    bypassFailCount++;
+    log("CF", `Bypass error: ${e.message}`);
   } finally {
     cfBypassInProgress = false;
     cfBypassResolve?.();
@@ -1879,26 +1897,34 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       cfReady: isCfReady(),
       hasCfClearance: storedCookies.has("cf_clearance"),
       hasCfBm: storedCookies.has("__cf_bm"),
+      cfClearanceExpiry: cfClearanceExpiry > 0 ? new Date(cfClearanceExpiry).toISOString() : null,
+      cfClearanceTTL: cfClearanceExpiry > 0 ? Math.max(0, Math.ceil((cfClearanceExpiry - Date.now()) / 1000)) : 0,
       bypassInProgress: cfBypassInProgress,
       bypassFailCount,
+      bypassMode: process.env.CF_HEADLESS === "true" ? "headless" : "headful",
       target: getTargetUrl(),
       proxyConfigured: isProxyConfigured(),
+      lastBypassError: getLastBypassError(),
       timestamp: new Date().toISOString(),
     }),
     refreshProxySession: async () => {
       bypassFailCount = 0;
       lastBypassAttempt = 0;
+      cfClearanceExpiry = 0;
       await refreshSession();
       const cfCookies = await getCloudflareBypassCookies();
       if (cfCookies) {
         for (const [k, v] of Object.entries(cfCookies.allCookies)) storedCookies.set(k, v);
+        if (cfCookies.cfClearance) cfClearanceExpiry = Date.now() + CF_CLEARANCE_LIFETIME;
       }
-      return { message: "Session yenilendi", sessionId: currentSessionId, cookies: storedCookies.size, cfReady: isCfReady() };
+      return { message: "Session yenilendi (headful bypass)", sessionId: currentSessionId, cookies: storedCookies.size, cfReady: isCfReady() };
     },
     triggerCfBypass: async () => {
       bypassFailCount = 0;
       lastBypassAttempt = 0;
+      cfClearanceExpiry = 0;
       setPuppeteerSessionId(currentSessionId);
+      log("CF", "Manual headful bypass triggered from admin panel");
       const cfCookies = await getCloudflareBypassCookies();
       if (cfCookies) {
         const newSid = getPuppeteerSessionId();
@@ -1907,10 +1933,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           proxyAgent = createProxyAgent();
         }
         for (const [k, v] of Object.entries(cfCookies.allCookies)) storedCookies.set(k, v);
-        return { success: true, message: "CF bypass tamamlandi", cookies: storedCookies.size, cfReady: isCfReady() };
+        if (cfCookies.cfClearance) cfClearanceExpiry = Date.now() + CF_CLEARANCE_LIFETIME;
+        return { success: true, message: "Headful CF bypass tamamlandı", cookies: storedCookies.size, cfReady: isCfReady(), hasCfClearance: !!cfCookies.cfClearance };
       }
       const errDetail = getLastBypassError();
-      return { success: false, message: errDetail || "CF bypass basarisiz", errorDetail: errDetail };
+      return { success: false, message: errDetail || "CF bypass başarısız", errorDetail: errDetail };
     },
   });
   await seedDefaultAdmin();
@@ -3232,12 +3259,17 @@ document.getElementById('code').addEventListener('keydown', function(e){
 
         if (isBlocked && retryCount < 1) {
           proxyRes.resume();
-          if (Date.now() - lastBypassAttempt > BYPASS_COOLDOWN_MS) {
-            try {
-              await startCfBypass();
-            } catch (e: any) {
-              log("PROXY", `Bypass error: ${e?.message || e}`);
-            }
+          log("PROXY", `Blocked (${proxyRes.statusCode}) on ${req.method} ${targetPath} - triggering headful bypass...`);
+          try {
+            await startCfBypass();
+          } catch (e: any) {
+            log("PROXY", `Bypass error: ${e?.message || e}`);
+          }
+          // Re-sync cookies with latest from bypass
+          const freshBypassCookies = getCachedCookies();
+          if (freshBypassCookies) {
+            for (const [k, v] of Object.entries(freshBypassCookies.allCookies)) storedCookies.set(k, v);
+            if (freshBypassCookies.cfClearance) cfClearanceExpiry = Date.now() + CF_CLEARANCE_LIFETIME;
           }
           headers["Cookie"] = mergeCookies(req.headers.cookie || "");
           // HTML GET: bypass sonrasi once tarayici ile dene (cf_clearance ile sayfa alinir), basarisizsa tek HTTPS retry
@@ -3681,6 +3713,12 @@ a{color:#e94560}</style></head>
       sessionId: currentSessionId,
       storedCookies: storedCookies.size,
       cfReady: isCfReady(),
+      hasCfClearance: storedCookies.has("cf_clearance"),
+      cfClearanceTTL: cfClearanceExpiry > 0 ? Math.max(0, Math.ceil((cfClearanceExpiry - Date.now()) / 1000)) : 0,
+      bypassMode: process.env.CF_HEADLESS === "true" ? "headless" : "headful",
+      bypassInProgress: cfBypassInProgress,
+      bypassFailCount,
+      lastBypassError: getLastBypassError(),
       status: test.ok ? "active" : "blocked",
       statusCode: test.statusCode,
       bodyPreview: test.body,
@@ -3762,19 +3800,23 @@ a{color:#e94560}</style></head>
       total: storedCookies.size,
       hasCfClearance: storedCookies.has("cf_clearance"),
       hasCfBm: storedCookies.has("__cf_bm"),
+      cfClearanceExpiry: cfClearanceExpiry > 0 ? new Date(cfClearanceExpiry).toISOString() : null,
+      cfClearanceTTL: cfClearanceExpiry > 0 ? Math.max(0, Math.ceil((cfClearanceExpiry - Date.now()) / 1000)) : 0,
       cookies: Array.from(storedCookies.keys()),
     });
   });
 
   app.post("/api/refresh-session", async (_req, res) => {
-    bypassFailCount = 0; // Reset fail count
-    lastBypassAttempt = 0; // Reset cooldown
+    bypassFailCount = 0;
+    lastBypassAttempt = 0;
+    cfClearanceExpiry = 0;
     await refreshSession();
     const cfCookies = await getCloudflareBypassCookies();
     if (cfCookies) {
       for (const [k, v] of Object.entries(cfCookies.allCookies)) storedCookies.set(k, v);
+      if (cfCookies.cfClearance) cfClearanceExpiry = Date.now() + CF_CLEARANCE_LIFETIME;
     }
-    res.json({ message: "Session refreshed", sessionId: currentSessionId, cookies: storedCookies.size, cfReady: isCfReady() });
+    res.json({ message: "Session refreshed (headful)", sessionId: currentSessionId, cookies: storedCookies.size, cfReady: isCfReady(), hasCfClearance: storedCookies.has("cf_clearance") });
   });
 
   // Diagnostic endpoint
