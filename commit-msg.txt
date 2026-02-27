@@ -1,0 +1,10 @@
+Cookie Pool sistemi eklendi - persistent cookie havuzu
+
+- cookie-pool.ts: Disk-backed cookie havuzu, snapshot yonetimi
+- Her bypass sonucu pool'a kaydedilir (data/cookie-pool.json)
+- PM2 restart'ta cookie'ler korunur, otomatik yuklenir
+- cf_clearance freshness tracking (8dk TTL)
+- Birden fazla snapshot saklama (max 20, 30dk TTL)
+- Domain degistiginde pool temizlenir
+- Admin API: /api/cookies-status pool bilgisi gosterir
+- Import edilen cookie'ler de pool'a kaydedilir

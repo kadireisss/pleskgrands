@@ -10,6 +10,7 @@ puppeteer.use(stealthPlugin);
 
 import { getTargetUrl, getTargetHost } from "./target-config";
 import { solveTurnstile } from "./captcha-solver";
+import { addSnapshot, getBestCookieSet, hasFreshCfClearance } from "./cookie-pool";
 
 // ═══════════════════════════════════════════════════════════════
 //  CONFIG
@@ -923,13 +924,53 @@ export async function getCloudflareBypassCookies(): Promise<CloudflareCookies | 
     };
   }
 
+  // Cookie pool'dan taze cookie var mı kontrol et
+  const targetDomain = getTargetHost();
+  if (hasFreshCfClearance(targetDomain)) {
+    const poolCookies = getBestCookieSet(targetDomain);
+    if (poolCookies && poolCookies["cf_clearance"]) {
+      log("CF", "Cookie pool'dan taze cf_clearance kullanılıyor");
+      globalCfClearance = poolCookies["cf_clearance"];
+      lastRefresh = now;
+      return {
+        cfBm: poolCookies["__cf_bm"] || "",
+        cfClearance: poolCookies["cf_clearance"],
+        cfuvid: poolCookies["_cfuvid"] || "",
+        allCookies: poolCookies,
+        userAgent: globalUserAgent,
+      };
+    }
+  }
+
+  // Pool'da cf_clearance yoksa bile mevcut cookie'leri dene
+  if (!globalCfClearance) {
+    const poolCookies = getBestCookieSet(targetDomain);
+    if (poolCookies && Object.keys(poolCookies).length >= 3) {
+      log("CF", `Cookie pool'dan ${Object.keys(poolCookies).length} cookie yüklendi (bypass denemesi öncesi)`);
+      cachedCookies = {
+        cfBm: poolCookies["__cf_bm"] || "",
+        cfClearance: poolCookies["cf_clearance"] || "",
+        cfuvid: poolCookies["_cfuvid"] || "",
+        allCookies: poolCookies,
+        userAgent: globalUserAgent,
+      };
+    }
+  }
+
   if (!PROXY_USER || !PROXY_PASS) {
     lastBypassError =
       "PROXY_USER ve PROXY_PASS .env'de zorunlu. DataImpulse hesabı ekleyin.";
-    log(
-      "CF",
-      "CF bypass için PROXY_USER ve PROXY_PASS .env'de zorunlu.",
-    );
+    log("CF", "CF bypass için PROXY_USER ve PROXY_PASS .env'de zorunlu.");
+
+    // Proxy yoksa pool'dan en iyi cookie'leri dön
+    const poolCookies = getBestCookieSet(targetDomain);
+    if (poolCookies) return {
+      cfBm: poolCookies["__cf_bm"] || "",
+      cfClearance: poolCookies["cf_clearance"] || "",
+      cfuvid: poolCookies["_cfuvid"] || "",
+      allCookies: poolCookies,
+      userAgent: globalUserAgent,
+    };
     return null;
   }
 
@@ -1048,14 +1089,16 @@ async function _doBypass(): Promise<CloudflareCookies | null> {
       lastRefresh = now;
       cachedCookies = result;
       consecutiveFailures = 0;
-      log("CF", `Bypass SUCCESS! cf_clearance obtained. Total cookies: ${cookieCount}`);
+      addSnapshot(result.allCookies, puppeteerSessionId, "bypass", getTargetHost());
+      log("CF", `Bypass SUCCESS! cf_clearance obtained. Total cookies: ${cookieCount}. Saved to pool.`);
       return result;
     }
 
     if (cookieCount > 0) {
       cachedCookies = result;
       consecutiveFailures = 0;
-      log("CF", `Bypass OK - ${cookieCount} cookies obtained (no cf_clearance, site may not require it)`);
+      addSnapshot(result.allCookies, puppeteerSessionId, "bypass", getTargetHost());
+      log("CF", `Bypass OK - ${cookieCount} cookies saved to pool (no cf_clearance, site may not require it)`);
       log("CF", `Cookie names: ${Object.keys(result.allCookies).join(", ")}`);
       return result;
     }

@@ -24,6 +24,15 @@ import {
   directBrowserLogin,
 } from "./cloudflare-bypass";
 import { isCaptchaConfigured, getBalance, solveRecaptchaV2, solveRecaptchaV3 } from "./captcha-solver";
+import {
+  loadPool,
+  addSnapshot,
+  updateCookies as updatePoolCookies,
+  getActiveCookies as getPoolCookies,
+  getPoolStatus,
+  clearPool,
+  importCookies as poolImportCookies,
+} from "./cookie-pool";
 import { storage } from "./storage";
 import { insertUserSchema } from "@shared/schema";
 import { registerAdminRoutes, seedDefaultAdmin } from "./admin-routes";
@@ -282,9 +291,16 @@ if (isProxyConfigured()) {
 }
 
 // ═══════════════════════════════════════════════════
-// ─── Cookie Management ───
+// ─── Cookie Management (with persistent pool) ───
 // ═══════════════════════════════════════════════════
 const storedCookies: Map<string, string> = new Map();
+
+// Startup: cookie pool'dan yükle
+const poolCookiesOnStart = loadPool();
+if (Object.keys(poolCookiesOnStart).length > 0) {
+  for (const [k, v] of Object.entries(poolCookiesOnStart)) storedCookies.set(k, v);
+  log("COOKIE-POOL", `${Object.keys(poolCookiesOnStart).length} cookie pool'dan yüklendi`);
+}
 
 function parseCookies(setCookieHeaders: string[] | undefined): Record<string, string> {
   const cookies: Record<string, string> = {};
@@ -294,6 +310,12 @@ function parseCookies(setCookieHeaders: string[] | undefined): Record<string, st
     if (match) cookies[match[1]] = match[2];
   }
   return cookies;
+}
+
+function storeAndSyncCookies(newCookies: Record<string, string>) {
+  if (!newCookies || Object.keys(newCookies).length === 0) return;
+  for (const [k, v] of Object.entries(newCookies)) storedCookies.set(k, v);
+  updatePoolCookies(newCookies);
 }
 
 function buildCookieString(): string {
@@ -470,6 +492,7 @@ async function startCfBypass(): Promise<void> {
         log("CF", `Session synced to Puppeteer: ${currentSessionId}`);
       }
       for (const [k, v] of Object.entries(cfCookies.allCookies)) storedCookies.set(k, v);
+      addSnapshot(cfCookies.allCookies, currentSessionId, "bypass", getTargetHost());
       if (cfCookies.cfClearance) {
         cfClearanceExpiry = Date.now() + CF_CLEARANCE_LIFETIME;
       }
@@ -1887,8 +1910,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     clearProxyCache: () => { responseCache.clear(); clearDiskCache(); },
     onTargetDomainChange: () => {
       storedCookies.clear();
+      clearPool();
       responseCache.clear(); clearDiskCache();
-      log("CONFIG", "Target domain degisti: cookie ve cache temizlendi, CF bypass yeniden gerekebilir.");
+      log("CONFIG", "Target domain degisti: cookie, pool ve cache temizlendi, CF bypass yeniden gerekebilir.");
     },
     getProxyStatus: () => ({
       sessionId: currentSessionId,
@@ -3788,7 +3812,10 @@ a{color:#e94560}</style></head>
       storedCookies.forEach((v, k) => (cookieObj[k] = v));
       setCachedCookies(cookieObj);
       
-      res.json({ success: true, imported, cookies: storedCookies.size });
+      // Cookie pool'a da kaydet
+      poolImportCookies(cookieObj, currentSessionId, getTargetHost());
+
+      res.json({ success: true, imported, cookies: storedCookies.size, poolSynced: true });
     } catch (error: any) {
       log("COOKIES", `Import error: ${error.message}`);
       res.status(500).json({ success: false, error: error.message });
@@ -3803,6 +3830,7 @@ a{color:#e94560}</style></head>
       cfClearanceExpiry: cfClearanceExpiry > 0 ? new Date(cfClearanceExpiry).toISOString() : null,
       cfClearanceTTL: cfClearanceExpiry > 0 ? Math.max(0, Math.ceil((cfClearanceExpiry - Date.now()) / 1000)) : 0,
       cookies: Array.from(storedCookies.keys()),
+      pool: getPoolStatus(),
     });
   });
 
