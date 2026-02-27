@@ -1,0 +1,7 @@
+Fix: Challenge detection false positive ve bypass akisi iyilestirildi
+
+- detectChallenge: ray id ve challenge-platform false positive kaldirildi
+- DOM-based detection: challenge-form, cf-challenge-running, challenge-stage
+- Title-based pattern: sadece gercek challenge basliklarini yakala
+- waitForChallengeResolution: title degisikligi ile hizli tespit
+- Bypass sonrasi cookie sync iyilestirildi

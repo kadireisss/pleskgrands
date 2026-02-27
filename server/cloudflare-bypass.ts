@@ -665,27 +665,25 @@ interface ChallengeInfo {
 async function detectChallenge(page: Page): Promise<ChallengeInfo> {
   return page.evaluate(() => {
     const title = document.title || "";
-    const bodyText = document.body?.innerText || "";
-    const html = document.documentElement?.outerHTML || "";
+    const bodyText = document.body?.innerText?.substring(0, 2000) || "";
 
-    const isChallengeTitle =
-      /just a moment|checking|cloudflare|attention required|security check/i.test(
-        title,
-      );
+    // Title-based detection (most reliable)
+    const challengeTitlePatterns = /^just a moment|^bir dakika|^checking|^attention required|^security check|^please wait/i;
+    const isChallengeTitle = challengeTitlePatterns.test(title.trim());
+
+    // Body-based detection (only very specific CF challenge strings)
     const isChallengeBody =
-      /verifying you are human|enable javascript|checking your browser|ray id/i.test(
-        bodyText,
-      );
-    const isChallengeHtml = /cf-challenge-running|challenge-platform/i.test(
-      html,
-    );
+      /verifying you are human|verifying that you are not a robot|enable javascript and cookies to continue|checking your browser before/i.test(bodyText);
 
-    const isChallenge = isChallengeTitle || isChallengeBody || isChallengeHtml;
+    // DOM-based detection (CF challenge specific elements)
+    const hasChallengeForm = !!document.getElementById("challenge-form");
+    const hasChallengeRunning = !!document.getElementById("cf-challenge-running");
+    const hasChallengeStage = !!document.querySelector("#challenge-stage");
+
+    const isChallenge = isChallengeTitle || isChallengeBody || hasChallengeForm || hasChallengeRunning || hasChallengeStage;
 
     const turnstileIframes = Array.from(
-      document.querySelectorAll(
-        'iframe[src*="challenges.cloudflare.com"]',
-      ),
+      document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]'),
     );
 
     let turnstileSiteKey: string | null = null;
@@ -710,7 +708,7 @@ async function detectChallenge(page: Page): Promise<ChallengeInfo> {
     if (isChallenge) {
       if (turnstileIframes.length > 0 || turnstileSiteKey) {
         type = "turnstile";
-      } else if (/managed[_-]?challenge/i.test(html)) {
+      } else if (hasChallengeForm) {
         type = "managed";
       } else {
         type = "js_challenge";
@@ -734,35 +732,57 @@ async function waitForChallengeResolution(
 ): Promise<boolean> {
   const startTime = Date.now();
   let pollCount = 0;
+  let initialTitle = "";
+
+  try {
+    initialTitle = await page.title();
+  } catch {}
 
   while (Date.now() - startTime < maxWait) {
     pollCount++;
     await sleep(CHALLENGE_POLL_INTERVAL);
 
     try {
-      const info = await detectChallenge(page);
+      // Quick title check first (faster than full DOM evaluation)
+      const currentTitle = await page.title();
+      const titleChanged = currentTitle !== initialTitle && !(/^just a moment|^bir dakika|^checking|^please wait/i.test(currentTitle.trim()));
 
+      if (titleChanged) {
+        log("CF", `Title changed: "${initialTitle}" -> "${currentTitle}" after ${pollCount} polls (${((Date.now() - startTime) / 1000).toFixed(1)}s)`);
+        await sleep(2000);
+        return true;
+      }
+
+      // Full challenge detection
+      const info = await detectChallenge(page);
       if (!info.isChallenge) {
         log("CF", `Challenge resolved after ${pollCount} polls (${((Date.now() - startTime) / 1000).toFixed(1)}s)`);
         return true;
       }
 
-      if (pollCount % 3 === 0) {
-        log(
-          "CF",
-          `Still waiting for challenge... type=${info.type}, title="${info.title}", elapsed=${((Date.now() - startTime) / 1000).toFixed(0)}s`,
-        );
+      if (pollCount % 5 === 0) {
+        log("CF", `Still waiting... type=${info.type}, title="${info.title}", elapsed=${((Date.now() - startTime) / 1000).toFixed(0)}s`);
       }
     } catch (err: any) {
-      // Navigation may have happened (redirect after challenge)
       if (err.message?.includes("Execution context was destroyed") ||
-          err.message?.includes("navigating")) {
+          err.message?.includes("navigating") ||
+          err.message?.includes("Target closed") ||
+          err.message?.includes("Session closed")) {
         log("CF", "Page navigated during challenge - likely resolved");
-        await sleep(2000);
+        await sleep(3000);
         return true;
       }
     }
   }
+
+  // Final check - maybe the title changed but we missed it
+  try {
+    const finalTitle = await page.title();
+    if (finalTitle !== initialTitle && !(/^just a moment|^bir dakika|^checking|^please wait/i.test(finalTitle.trim()))) {
+      log("CF", `Challenge resolved on final check. Title: "${finalTitle}"`);
+      return true;
+    }
+  } catch {}
 
   return false;
 }
@@ -979,18 +999,11 @@ async function _doBypass(): Promise<CloudflareCookies | null> {
 
     // Check for challenge
     const challengeInfo = await detectChallenge(page);
-    log(
-      "CF",
-      `Challenge detection: type=${challengeInfo.type}, title="${challengeInfo.title}"`,
-    );
+    log("CF", `Challenge detection: type=${challengeInfo.type}, title="${challengeInfo.title}"`);
 
     if (challengeInfo.isChallenge) {
-      log(
-        "CF",
-        `${challengeInfo.type} challenge detected. Headful Chrome will attempt auto-solve...`,
-      );
+      log("CF", `${challengeInfo.type} challenge detected. Headful Chrome attempting auto-solve...`);
 
-      // For JS challenge: headful Chrome with real TLS auto-solves most
       if (challengeInfo.type === "js_challenge" || challengeInfo.type === "managed") {
         log("CF", "Waiting for JS/managed challenge auto-resolution...");
         const resolved = await waitForChallengeResolution(page, CHALLENGE_MAX_WAIT);
@@ -999,83 +1012,56 @@ async function _doBypass(): Promise<CloudflareCookies | null> {
           log("CF", "Auto-resolution timed out, checking for Turnstile...");
           const recheck = await detectChallenge(page);
           if (recheck.type === "turnstile") {
-            const turnstileOk = await handleTurnstileChallenge(
-              page,
-              recheck.turnstileSiteKey,
-              targetUrl,
-            );
-            if (!turnstileOk) {
-              log("CF", "Turnstile solve also failed");
-            }
+            await handleTurnstileChallenge(page, recheck.turnstileSiteKey, targetUrl);
           }
         }
       } else if (challengeInfo.type === "turnstile") {
-        // First wait a bit - sometimes Turnstile auto-resolves in headful
         log("CF", "Turnstile detected, waiting 8s for potential auto-resolve...");
         await sleep(8000);
-
         const recheck = await detectChallenge(page);
         if (recheck.isChallenge) {
-          await handleTurnstileChallenge(
-            page,
-            challengeInfo.turnstileSiteKey,
-            targetUrl,
-          );
+          await handleTurnstileChallenge(page, challengeInfo.turnstileSiteKey, targetUrl);
         } else {
           log("CF", "Turnstile auto-resolved in headful mode!");
         }
       }
     } else {
-      log("CF", "No challenge detected - page loaded directly");
+      log("CF", `No challenge detected - page loaded directly. Title: "${challengeInfo.title}"`);
     }
 
-    // Wait for any pending redirects to complete
+    // Wait for redirects and page load to complete
     await sleep(2000);
-
-    // Wait for final page load after redirect
     try {
-      await page.waitForFunction(
-        () => document.readyState === "complete",
-        { timeout: 10000 },
-      );
+      await page.waitForFunction(() => document.readyState === "complete", { timeout: 10000 });
     } catch {}
 
-    // Final challenge check
-    const finalCheck = await detectChallenge(page);
-    if (finalCheck.isChallenge) {
-      log("CF", `Challenge still present after all attempts. Title: "${finalCheck.title}"`);
-      consecutiveFailures++;
-    }
-
-    // Extract cookies
+    // Extract cookies - even without cf_clearance, all cookies are useful
     const result = await extractAllCookies(page);
+    const cookieCount = Object.keys(result.allCookies).length;
+    const currentTitle = await page.title().catch(() => "unknown");
     await page.close();
+
+    log("CF", `Page title after bypass: "${currentTitle}", cookies: ${cookieCount}`);
 
     if (result.cfClearance) {
       globalCfClearance = result.cfClearance;
       lastRefresh = now;
       cachedCookies = result;
       consecutiveFailures = 0;
-      log(
-        "CF",
-        `Bypass SUCCESS! cf_clearance obtained. Total cookies: ${Object.keys(result.allCookies).length}`,
-      );
+      log("CF", `Bypass SUCCESS! cf_clearance obtained. Total cookies: ${cookieCount}`);
       return result;
     }
 
-    // Even without cf_clearance, return all cookies if we have some
-    if (Object.keys(result.allCookies).length > 0) {
+    if (cookieCount > 0) {
       cachedCookies = result;
-      log(
-        "CF",
-        `Partial bypass - ${Object.keys(result.allCookies).length} cookies obtained (no cf_clearance)`,
-      );
+      consecutiveFailures = 0;
+      log("CF", `Bypass OK - ${cookieCount} cookies obtained (no cf_clearance, site may not require it)`);
       log("CF", `Cookie names: ${Object.keys(result.allCookies).join(", ")}`);
       return result;
     }
 
     consecutiveFailures++;
-    lastBypassError = "cf_clearance alınamadı. Proxy ve target domain doğru mu kontrol edin.";
+    lastBypassError = "Cookie alınamadı. Proxy ve target domain doğru mu kontrol edin.";
     log("CF", lastBypassError);
     return null;
   } catch (err: any) {
